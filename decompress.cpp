@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <vector>
 
 class InvalidFormat :public std::runtime_error {
  public:
@@ -43,12 +44,12 @@ uint32_t read_uint32(std::istream &is) {
   return result;
 }
 
-size_t length_table[][2] = {
+constexpr size_t length_table[][2] = {
     {0, 3}, {0, 4}, {0, 5}, {0, 6}, {0, 7}, {0, 8}, {0, 9}, {0, 10}, {1, 11}, {1, 13}, {1, 15}, {1, 17}, {2, 19}, {2, 23}, {2, 27}, {2, 31}, {3, 35}, {3, 43}, {3, 51}, {3, 59}, {4, 67}, {4, 83}, {4, 99}, {4, 115}, {5, 131}, {5, 163}, {5, 195}, {5, 227}, {0, 258}
 };
 
 // code -> (extra_bits, start_offset)
-size_t distance_table[][2] = {
+constexpr size_t distance_table[][2] = {
     {0, 1}, {0, 2}, {0, 3}, {0, 4}, {1, 5}, {1, 7}, {2, 9}, {2, 13}, {3, 17}, {3, 25}, {4, 33}, {4, 49}, {5, 65}, {5, 97}, {6, 129}, {6, 193}, {7, 257}, {7, 385}, {8, 513}, {8, 769}, {9, 1025}, {9, 1537}, {10, 2049}, {10, 3073}, {11, 4097}, {11, 6145}, {12, 8193}, {12, 12289}, {13, 16385}, {13, 24577},{0,0}, {0,0}
 };
 
@@ -69,16 +70,42 @@ class Deflate {
     return total_size;
   }
 
-  std::tuple<size_t, bool> deflate_block(std::ostream &os) {
-    auto bfinal = read_bit(1);
+  uint32_t read_dynamic() {
 
-    // 32KiB maximum
-    auto block_buffer = new uint8_t[33 * 1024];
+  }
+
+  void read_dynamic_huffman_tree_header() {
+    auto hlit = read_bit(5) + 257;
+    auto hdist = read_bit(5) + 1;
+    auto hclen = read_bit(4) + 4;
+
+    std::vector<int> code_lengths(19, 0);
+
+    int index[] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+    for (int i = 0; i < hclen; i++) {
+      auto code_length = read_bit(3);
+      // i < 19
+      code_lengths[index[i]] = code_length;
+    }
+
+    for (int i = 0; i < code_lengths.size(); i++) {
+      std::cout << i << ": " << code_lengths[i] << std::endl;
+    }
+
+    for (int lit = 0; lit < hlit; lit++) {
+
+    }
+
+
+    assert(0);
+  }
+
+
+  // 32KiB maximum
+  std::vector<uint8_t> block_buffer = std::vector<uint8_t>(33*1024);
+
+  size_t deflate_huffman(std::ostream &os) {
     size_t block_offset = 0;
-    // assume static huffman
-    auto btype = read_bit(2);
-    assert(btype == 0b10);
-
     size_t original_size = 0;
     while (true) {
       auto code = read_fixed();
@@ -109,6 +136,10 @@ class Deflate {
         if (distance == 0) {
           throw InvalidFormat("distance should not be 0");
         }
+        assert(distance <= block_offset);
+        assert(length <= distance);
+        auto start = block_buffer.data() + block_offset - distance;
+        std::copy(start, start + length, block_buffer.data() + block_offset);
         for (size_t i = 0; i < length; i++) {
           block_buffer[block_offset + i] = block_buffer[block_offset - distance + i];
         }
@@ -119,8 +150,52 @@ class Deflate {
     auto block_size = block_offset;
 
     original_size += block_size;
-    os.write((char*)block_buffer, block_size);
-    return {block_size, bfinal};
+    os.write((char*)block_buffer.data(), block_size);
+    return block_size;
+  }
+
+
+  size_t deflate_dynamic_huffman(std::ostream &os) {
+    assert(0);
+  }
+
+  template <typename T>
+  T read_le() {
+    T value;
+    for (int i = 0; i < sizeof(T); i++) {
+      reinterpret_cast<uint8_t*>(&value)[i] = is_.get();
+      assert(is_);
+    }
+    return value;
+  }
+
+  std::tuple<size_t, bool> deflate_block(std::ostream &os) {
+    auto bfinal = read_bit(1);
+
+    // 0b10: static huffman
+    // 0b01: dynamic huffman
+    auto btype = read_bit(2);
+    if (btype == 0b10) {
+      auto block_size = deflate_huffman(os);
+      return {block_size, bfinal};
+    } else if (btype == 0b01) {
+      read_dynamic_huffman_tree_header();
+      auto block_size = deflate_huffman(os);
+      return {block_size, bfinal};
+    } else if (btype == 0) {
+      discard_remaining_bits();
+      assert(cached_byte_size == 0);
+
+      auto len = read_le<uint16_t>();
+      auto nlen = read_le<uint16_t>();
+      assert((len ^ nlen) == 0xffff);
+      for (int i = 0; i < len; i++) {
+        os.put(is_.get());
+        assert(is_);
+      }
+
+      return {len, bfinal};
+    }
   }
 
  private:
@@ -133,6 +208,9 @@ class Deflate {
       }
       cached_byte = c;
     }
+  }
+  void discard_remaining_bits() {
+    cached_byte_size = 0;
   }
 
   // n < 32
@@ -226,10 +304,11 @@ void read_stream(std::istream &is, std::ostream &os) {
   size_t decompressed_size = deflate.deflate(os);
 
   auto crc32 = read_uint32(is);
+  std::cout << "crc32: " << crc32 << std::endl;
   auto original_size = read_uint32(is);
-//  if (decompressed_size != original_size) {
-//    throw InvalidFormat("data corruption, original_size != decompressed_size");
-//  }
+  if (decompressed_size != original_size) {
+    throw InvalidFormat("data corruption, original_size != decompressed_size");
+  }
   std::cout << "original_size: " << original_size << std::endl;
 }
 
