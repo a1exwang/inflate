@@ -60,6 +60,7 @@ class Deflate {
   size_t deflate(std::ostream &os) {
     size_t total_size = 0;
     while (true) {
+      std::cout << "start to deflate block off=" << total_size << std::endl;
       auto [size, eof] = deflate_block(os);
       total_size += size;
       std::cout << "block size " << size<< std::endl;
@@ -70,49 +71,164 @@ class Deflate {
     return total_size;
   }
 
-  uint32_t read_dynamic() {
+  struct HuffmanTree {
+    explicit HuffmanTree(const std::vector<size_t> &code_lengths)
+        :counts(code_lengths.size(), 0), offsets(code_lengths.size(), 0), skip(code_lengths.size(), 0) {
 
+      std::vector<std::vector<int>> n_codes(code_lengths.size(), std::vector<int>(0));
+      for (int code = 0; code < code_lengths.size(); code++) {
+        counts[code_lengths[code]]++;
+        n_codes[code_lengths[code]].push_back(code);
+      }
+
+      counts[0] = 0;
+      for (int i = 1; i < offsets.size(); i++) {
+        offsets[i] = counts[i-1] + offsets[i-1];
+      }
+
+      uint64_t last_skip = 0;
+      for (int i = 1; i < counts.size(); i++) {
+        last_skip = (last_skip + counts[i-1]) << 1u;
+        skip[i] = last_skip;
+      }
+
+      for (int i = 1; i < n_codes.size(); i++) {
+        for (auto code : n_codes[i]) {
+          symbols.push_back(code);
+        }
+      }
+    }
+    void print() {
+      for (int i = 0; i < symbols.size(); i++) {
+        std::cout << "symbols[" << i << "] = " << symbols[i] << std::endl;
+      }
+      for (auto offset : offsets) {
+        std::cout << offset << " ";
+      }
+      std::cout << std::endl;
+      for (auto count : counts) {
+        std::cout << count << " ";
+      }
+      std::cout << std::endl;
+
+    }
+    std::vector<size_t> offsets;
+    std::vector<size_t> counts;
+    std::vector<size_t> symbols;
+    std::vector<uint64_t> skip;
+  };
+
+  uint32_t read_value_from_huffman(const HuffmanTree &tree) {
+    uint64_t value = 0;
+    size_t bit_length = 0;
+    while (true) {
+      value |= read_bit(1);
+      bit_length++;
+      assert(bit_length < tree.offsets.size());
+
+      auto off = value - tree.skip[bit_length];
+      if (off < tree.counts[bit_length]) {
+        auto index = tree.offsets[bit_length] + off;
+        return tree.symbols[index];
+      }
+      value <<= 1u;
+    }
+  }
+
+  std::vector<size_t> generate_huffman_table(HuffmanTree &huffman_tree, const size_t lit_count) {
+    std::vector<size_t> huffman_table;
+    int prev = -1;
+
+    for (int lit = 0; lit < lit_count; ) {
+      auto value = read_value_from_huffman(huffman_tree);
+//      std::cout << "read " << (int)value << std::endl;
+
+      /**
+       0 - 15: Represent code lengths of 0 - 15
+       16: Copy the previous code length 3 - 6 times.
+           The next 2 bits indicate repeat length
+                 (0 = 3, ... , 3 = 6)
+              Example:  Codes 8, 16 (+2 bits 11),
+                        16 (+2 bits 10) will expand to
+                        12 code lengths of 8 (1 + 6 + 5)
+       17: Repeat a code length of 0 for 3 - 10 times.
+           (3 bits of length)
+       18: Repeat a code length of 0 for 11 - 138 times
+           (7 bits of length)
+       */
+
+      if (value == 16) {
+        assert(prev != -1);
+        int copy_previous_count = read_bit_le(2) + 3;
+        for (int i = 0; i < copy_previous_count; i++) {
+          huffman_table.push_back(prev);
+        }
+        lit += copy_previous_count;
+      } else if (17 <= value && value <= 18) {
+        int zero_count = 0;
+        if (value == 17) {
+          zero_count = read_bit_le(3) + 3;
+        } else {
+          zero_count = read_bit_le(7) + 11;
+        }
+        for (int i = 0; i < zero_count; i++) {
+          huffman_table.push_back(0);
+        }
+        prev = 0;
+        lit += zero_count;
+      } else if (value < 16) {
+        huffman_table.push_back(value);
+        prev = value;
+        lit++;
+      } else {
+        throw std::runtime_error("decode invalid value, should be [0, 18], but '" + std::to_string(value) + "'");
+      }
+    }
+//    for (int i = 0; i < huffman_table.size(); i++) {
+//      if (huffman_table[i] != 0) {
+//        std::cout << std::hex << std::setw(2) << std::setfill('0') << i << "(" << (char)i << ") --> " << huffman_table[i] << std::endl;
+//      }
+//    }
+
+    return huffman_table;
   }
 
   void read_dynamic_huffman_tree_header() {
-    auto hlit = read_bit(5) + 257;
-    auto hdist = read_bit(5) + 1;
-    auto hclen = read_bit(4) + 4;
+    const auto hlit = read_bit_le(5) + 257;
+    const auto hdist = read_bit_le(5) + 1;
+    const auto hclen = read_bit_le(4) + 4;
 
-    std::vector<int> code_lengths(19, 0);
+    std::vector<size_t> code_lengths(19, 0);
 
     int index[] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
     for (int i = 0; i < hclen; i++) {
-      auto code_length = read_bit(3);
-      // i < 19
+      auto code_length = read_bit_le(3);
       code_lengths[index[i]] = code_length;
     }
 
-    for (int i = 0; i < code_lengths.size(); i++) {
-      std::cout << i << ": " << code_lengths[i] << std::endl;
-    }
+    HuffmanTree code_length_huffman_tree(code_lengths);
+//    code_length_huffman_tree.print();
 
-    for (int lit = 0; lit < hlit; lit++) {
+    auto lit_table = generate_huffman_table(code_length_huffman_tree, hlit);
+    lit_huffman_tree = std::make_unique<HuffmanTree>(lit_table);
 
-    }
-
-
-    assert(0);
+    auto dist_table = generate_huffman_table(code_length_huffman_tree, hdist);
+    dist_huffman_tree = std::make_unique<HuffmanTree>(dist_table);
+//    dist_huffman_tree->print();
   }
 
-
-  // 32KiB maximum
-  std::vector<uint8_t> block_buffer = std::vector<uint8_t>(33*1024);
-
-  size_t deflate_huffman(std::ostream &os) {
+  size_t deflate_huffman(std::ostream &os, bool fixed) {
     size_t block_offset = 0;
     size_t original_size = 0;
     while (true) {
-      auto code = read_fixed();
+      auto code = read_lit(fixed);
       assert(code <= 287);
       if (code < 256) {
         block_buffer[block_offset++] = code;
+//        std::cerr <<(char)code;
+//        std::cout << "decode lit 0x" << std::hex << code << std::endl;
       } else if (code == 256) {
+//        std::cout << std::endl << "---------------------------" << std::endl;
         break;
       } else {
         // first read length
@@ -120,14 +236,22 @@ class Deflate {
         auto length_code = code - 257;
         {
           auto [extra_bits, start_off] = length_table[length_code];
-          length = read_bit(extra_bits) + start_off;
+          length = read_bit_le(extra_bits) + start_off;
         }
 
-        // then distance
-        auto dist_code = read_bit(5);
+        uint32_t dist_code = 0;
+        if (fixed) {
+          // then distance
+          dist_code = read_bit(5);
+        } else {
+          assert(dist_huffman_tree);
+          dist_code = read_value_from_huffman(*dist_huffman_tree);
+//          std::cout << "huff " << dist_huffman_tree->symbols[0] <<  " dist_code: " << dist_code << std::endl;
+        }
+
         {
-          auto [ebits, start_off] = distance_table[dist_code];
-          distance = read_bit(ebits) + start_off;
+          auto [extra_bits, start_off] = distance_table[dist_code];
+          distance = read_bit_le(extra_bits) + start_off;
         }
 
         if (distance > block_offset) {
@@ -136,13 +260,19 @@ class Deflate {
         if (distance == 0) {
           throw InvalidFormat("distance should not be 0");
         }
-        assert(distance <= block_offset);
-        assert(length <= distance);
-        auto start = block_buffer.data() + block_offset - distance;
-        std::copy(start, start + length, block_buffer.data() + block_offset);
-        for (size_t i = 0; i < length; i++) {
+        auto start = block_offset - distance;
+        // length might <= distance according to the standard.
+        // The correct behavior is as follows
+        assert(block_offset + length <= block_buffer.size());
+        for (int i = 0; i < length; i++) {
           block_buffer[block_offset + i] = block_buffer[block_offset - distance + i];
         }
+//        std::copy(start, start + length, block_buffer.data() + block_offset);
+
+//        std::cout << "match " << length << ", " << distance;
+//        std::cerr.write((char*)block_buffer.data()+block_offset, length);
+//        std::cerr << std::endl;
+
         block_offset += length;
       }
     }
@@ -154,10 +284,6 @@ class Deflate {
     return block_size;
   }
 
-
-  size_t deflate_dynamic_huffman(std::ostream &os) {
-    assert(0);
-  }
 
   template <typename T>
   T read_le() {
@@ -176,11 +302,11 @@ class Deflate {
     // 0b01: dynamic huffman
     auto btype = read_bit(2);
     if (btype == 0b10) {
-      auto block_size = deflate_huffman(os);
+      auto block_size = deflate_huffman(os, true);
       return {block_size, bfinal};
     } else if (btype == 0b01) {
       read_dynamic_huffman_tree_header();
-      auto block_size = deflate_huffman(os);
+      auto block_size = deflate_huffman(os, false);
       return {block_size, bfinal};
     } else if (btype == 0) {
       discard_remaining_bits();
@@ -195,6 +321,8 @@ class Deflate {
       }
 
       return {len, bfinal};
+    } else {
+      assert(0);
     }
   }
 
@@ -227,7 +355,32 @@ class Deflate {
     return result;
   }
 
-  uint32_t read_fixed() {
+  uint32_t read_bit_le(size_t n) {
+    assert(n < 32);
+    uint32_t result = 0;
+    for (size_t i = 0; i < n; i++) {
+      ensure_cached_byte();
+      auto target_bit = ((uint32_t)cached_byte >> (8-cached_byte_size)) & 1u;
+      result |= (target_bit << i);
+      cached_byte_size--;
+    }
+    return result;
+  }
+
+  uint32_t read_lit(bool fixed) {
+    if (fixed) {
+      return read_fixed_lit();
+    } else {
+      return read_dynamic_lit();
+    }
+  }
+
+  uint32_t read_dynamic_lit() {
+    assert(lit_huffman_tree);
+    return read_value_from_huffman(*lit_huffman_tree);
+  }
+
+  uint32_t read_fixed_lit() {
     auto prefix4 = read_bit(4);
     if (prefix4 < 0b0011) {
       // 256 - 279
@@ -254,6 +407,12 @@ class Deflate {
   }
 
  private:
+  std::unique_ptr<HuffmanTree> lit_huffman_tree;
+  std::unique_ptr<HuffmanTree> dist_huffman_tree;
+
+  // 32KiB maximum
+  std::vector<uint8_t> block_buffer = std::vector<uint8_t>(1024*1024);
+
   uint8_t cached_byte;
   size_t cached_byte_size;
   std::istream& is_;
