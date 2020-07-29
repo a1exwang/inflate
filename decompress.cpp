@@ -72,6 +72,7 @@ class Deflate {
   }
 
   struct HuffmanTree {
+    HuffmanTree() { }
     explicit HuffmanTree(const std::vector<size_t> &code_lengths)
         :counts(code_lengths.size(), 0), offsets(code_lengths.size(), 0), skip(code_lengths.size(), 0) {
 
@@ -193,7 +194,7 @@ class Deflate {
     return huffman_table;
   }
 
-  void read_dynamic_huffman_tree_header() {
+  std::tuple<HuffmanTree, HuffmanTree> read_dynamic_huffman_tree_header() {
     const auto hlit = read_bit_le(5) + 257;
     const auto hdist = read_bit_le(5) + 1;
     const auto hclen = read_bit_le(4) + 4;
@@ -210,18 +211,30 @@ class Deflate {
 //    code_length_huffman_tree.print();
 
     auto lit_table = generate_huffman_table(code_length_huffman_tree, hlit);
-    lit_huffman_tree = std::make_unique<HuffmanTree>(lit_table);
+    HuffmanTree lit_tree(lit_table);
 
     auto dist_table = generate_huffman_table(code_length_huffman_tree, hdist);
-    dist_huffman_tree = std::make_unique<HuffmanTree>(dist_table);
+    HuffmanTree dist_tree(dist_table);
 //    dist_huffman_tree->print();
+    return std::make_tuple(lit_tree, dist_tree);
   }
 
-  size_t deflate_huffman(std::ostream &os, bool fixed) {
+  size_t deflate_huffman(
+      std::ostream &os,
+      bool fixed,
+      const HuffmanTree &lit_tree,
+      const HuffmanTree &dist_tree) {
+
     size_t block_offset = 0;
     size_t original_size = 0;
     while (true) {
-      auto code = read_lit(fixed);
+
+      uint32_t code;
+      if (fixed) {
+        code = read_fixed_lit();
+      } else {
+        code = read_value_from_huffman(lit_tree);
+      }
       assert(code <= 287);
       if (code < 256) {
         block_buffer[block_offset++] = code;
@@ -244,8 +257,7 @@ class Deflate {
           // then distance
           dist_code = read_bit(5);
         } else {
-          assert(dist_huffman_tree);
-          dist_code = read_value_from_huffman(*dist_huffman_tree);
+          dist_code = read_value_from_huffman(dist_tree);
 //          std::cout << "huff " << dist_huffman_tree->symbols[0] <<  " dist_code: " << dist_code << std::endl;
         }
 
@@ -254,18 +266,31 @@ class Deflate {
           distance = read_bit_le(extra_bits) + start_off;
         }
 
-        if (distance > block_offset) {
-          throw InvalidFormat("distance should not > block_offset");
-        }
         if (distance == 0) {
           throw InvalidFormat("distance should not be 0");
         }
-        auto start = block_offset - distance;
-        // length might <= distance according to the standard.
-        // The correct behavior is as follows
-        assert(block_offset + length <= block_buffer.size());
-        for (int i = 0; i < length; i++) {
-          block_buffer[block_offset + i] = block_buffer[block_offset - distance + i];
+        if (distance > block_offset) {
+          // FIXME: Currently we only support "distance" within one block distance
+          assert(prev_block_size > (distance - block_offset));
+          auto prev_block_off = prev_block_size - (distance - block_offset);
+          if (length <= prev_block_size - prev_block_off) {
+            std::copy(&prev_block_buffer[prev_block_off], prev_block_buffer.data()+prev_block_off+length, &block_buffer[block_offset]);
+          } else {
+            std::copy(&prev_block_buffer[prev_block_off], prev_block_buffer.data()+prev_block_size, &block_buffer[block_offset]);
+
+            auto length_copied = (prev_block_size - prev_block_off);
+            auto remaining_length = length - length_copied;
+            for (int i = 0; i < remaining_length; i++) {
+              block_buffer[block_offset + length_copied + i] = block_buffer[i];
+            }
+          }
+        } else {
+          // length might <= distance according to the standard.
+          // The correct behavior is as follows
+          assert(block_offset + length <= block_buffer.size());
+          for (int i = 0; i < length; i++) {
+            block_buffer[block_offset + i] = block_buffer[block_offset - distance + i];
+          }
         }
 //        std::copy(start, start + length, block_buffer.data() + block_offset);
 
@@ -301,13 +326,12 @@ class Deflate {
     // 0b10: static huffman
     // 0b01: dynamic huffman
     auto btype = read_bit(2);
+    size_t block_size = 0;
     if (btype == 0b10) {
-      auto block_size = deflate_huffman(os, true);
-      return {block_size, bfinal};
+      block_size = deflate_huffman(os, true, HuffmanTree(), HuffmanTree());
     } else if (btype == 0b01) {
-      read_dynamic_huffman_tree_header();
-      auto block_size = deflate_huffman(os, false);
-      return {block_size, bfinal};
+      auto [lit_tree, dist_tree] = read_dynamic_huffman_tree_header();
+      block_size = deflate_huffman(os, false, lit_tree, dist_tree);
     } else if (btype == 0) {
       discard_remaining_bits();
       assert(cached_byte_size == 0);
@@ -320,10 +344,14 @@ class Deflate {
         assert(is_);
       }
 
-      return {len, bfinal};
+      block_size = len;
     } else {
       assert(0);
     }
+
+    std::swap(block_buffer, prev_block_buffer);
+    prev_block_size = block_size;
+    return {block_size, bfinal};
   }
 
  private:
@@ -367,19 +395,6 @@ class Deflate {
     return result;
   }
 
-  uint32_t read_lit(bool fixed) {
-    if (fixed) {
-      return read_fixed_lit();
-    } else {
-      return read_dynamic_lit();
-    }
-  }
-
-  uint32_t read_dynamic_lit() {
-    assert(lit_huffman_tree);
-    return read_value_from_huffman(*lit_huffman_tree);
-  }
-
   uint32_t read_fixed_lit() {
     auto prefix4 = read_bit(4);
     if (prefix4 < 0b0011) {
@@ -407,11 +422,10 @@ class Deflate {
   }
 
  private:
-  std::unique_ptr<HuffmanTree> lit_huffman_tree;
-  std::unique_ptr<HuffmanTree> dist_huffman_tree;
-
   // 32KiB maximum
   std::vector<uint8_t> block_buffer = std::vector<uint8_t>(1024*1024);
+  std::vector<uint8_t> prev_block_buffer = std::vector<uint8_t>(1024*1024);
+  size_t prev_block_size = 0;
 
   uint8_t cached_byte;
   size_t cached_byte_size;
