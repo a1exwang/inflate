@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 project(lz-a1ex)
+add_compile_options(-fcoroutines)
 set(CMAKE_CXX_STANDARD 20)
 add_executable(decompress decompress.cpp)
 add_executable(infgen infgen.c)
