@@ -11,7 +11,6 @@
 #include <list>
 #include <unordered_map>
 
-#include <coroutine>
 
 class InvalidFormat :public std::runtime_error {
  public:
@@ -57,6 +56,9 @@ void write_uint32(std::ostream &os, uint32_t value) {
   os.put(value & 0xffu); value >>= 8u;
   os.put(value & 0xffu);
 }
+
+constexpr int MinMatchLength = 3;
+constexpr int MaxMatchLength = 258;
 
 constexpr size_t length_table[][2] = {
     {0, 3}, {0, 4}, {0, 5}, {0, 6}, {0, 7}, {0, 8}, {0, 9}, {0, 10}, {1, 11}, {1, 13}, {1, 15}, {1, 17}, {2, 19}, {2, 23}, {2, 27}, {2, 31}, {3, 35}, {3, 43}, {3, 51}, {3, 59}, {4, 67}, {4, 83}, {4, 99}, {4, 115}, {5, 131}, {5, 163}, {5, 195}, {5, 227}, {0, 258}, {std::numeric_limits<size_t>::max(), 259/* sentry object */}
@@ -299,7 +301,8 @@ struct HuffmanTree {
 template <typename T>
 class RingBuffer {
  public:
-  explicit RingBuffer(size_t max_size) :data_(max_size) {
+  // When the buffer is full, start_ = end_ + 1
+  explicit RingBuffer(size_t max_size) :data_(max_size + 1) {
     assert(max_size > 1);
   }
 
@@ -346,9 +349,10 @@ class RingBuffer {
     if (next(end_) == start_) {
       // buffer is full
       auto ret = data_[start_];
+      data_[end_] = data;
+
       start_ = next(start_);
       end_ = next(end_);
-      data_[end_] = data;
       return ret;
     } else {
       data_[end_] = data;
@@ -622,6 +626,7 @@ class Inflate {
       }
     } else {
       assert(0);
+      return 0;
     }
   }
 
@@ -729,11 +734,19 @@ HuffmanTree create_huffman_tree(const std::vector<size_t> &freqs) {
 
   std::vector<size_t> lengths(freqs.size(), 0);
   if (nodes.empty()) {
-    // TODO: not implemented
-    assert(0);
+    assert(freqs.size() >= 2);
+    // These are just placeholders to make a valid huffman tree
+    lengths[0] = 1;
+    lengths[1] = 1;
   } else if (nodes.size() == 1) {
     // DEFLATE format does not support zero length tree
+    assert(freqs.size() >= 2);
     lengths[nodes.front()->code] = 1;
+    if (nodes.front()->code == 0) {
+      lengths[1] = 1;
+    } else {
+      lengths[0] = 1;
+    }
   } else {
     auto compare = [](Node* lhs, Node *rhs) { return *lhs < *rhs; };
     std::make_heap(nodes.begin(), nodes.end(), compare);
@@ -765,6 +778,7 @@ std::tuple<size_t,size_t, size_t> calculate_length_code(size_t length) {
     }
   }
   assert(0);
+  return {};
 }
 
 // dist_code, length of extra bits, content of extra bits
@@ -775,6 +789,7 @@ std::tuple<size_t, size_t, size_t> calculate_dist_code(size_t dist) {
     }
   }
   assert(0);
+  return {};
 }
 
 class Deflate {
@@ -793,19 +808,23 @@ class Deflate {
     // HCLEN
     writer.write_le(19-4, 4);
 
-    // No compression: all code lengths are 5 bits(use lit value)
-    for (int i = 0; i < 19; i++) {
-      writer.write_be(5, 3);
+    // TODO:
+    // No compression: we just hard code the bits, we dont use 16-18 currently
+    writer.write_le(2, 3);
+    writer.write_le(3, 3);
+    writer.write_le(3, 3);
+    for (int i = 0; i < 16; i++) {
+      writer.write_le(5, 3);
     }
 
     for (int i = 0; i < lit_tree.size(); i++) {
       auto [bits, nbits] = lit_tree.at(i);
-      writer.write_be(nbits, 5);
+      writer.write_be(nbits | 0b10000u, 5);
     }
 
     for (int i = 0; i < dist_tree.size(); i++) {
       auto [bits, nbits] = dist_tree.at(i);
-      writer.write_be(nbits, 5);
+      writer.write_be(nbits | 0b10000u, 5);
     }
   }
 
@@ -817,11 +836,12 @@ class Deflate {
       lz77_encoded.clear();
       auto block_size = lz77_encode_block(65536);
       total_size += block_size;
+      std::cerr << "lz77 block " << total_size << std::endl;
 
       /*
        * Calculate count of lit/length and distance
        */
-      std::vector<size_t> lit_counts(287, 0), dist_counts(30, 0);
+      std::vector<size_t> lit_counts(286, 0), dist_counts(30, 0);
       for (auto [c, distance, length] : lz77_encoded) {
         if (length != 0) {
           auto [lit_code, _1, _2] = calculate_length_code(length);
@@ -854,12 +874,13 @@ class Deflate {
           {
             auto [len_code, nbits, bits] = calculate_length_code(length);
             lit_tree.write_value(writer, len_code);
+            writer.write_le(bits, nbits);
           }
 
           {
             auto [dist_code, nbits, bits] = calculate_dist_code(distance);
             dist_tree.write_value(writer, dist_code);
-            writer.write_be(bits, nbits);
+            writer.write_le(bits, nbits);
           }
         }
         if (c == EOF) {
@@ -867,7 +888,9 @@ class Deflate {
         } else {
           lit_tree.write_value(writer, c);
         }
+//        std::cerr << "Huffman " << c << " " << distance << " " << length << std::endl;
       }
+
     }
 
     // This is the final block.
@@ -949,17 +972,15 @@ class Deflate {
   // yields lit, length, distance
   // reads from is_ and write to writer_
   size_t lz77_encode_block(size_t max_size) {
-    constexpr int min_prefix_length = 3;
-    constexpr int max_prefix_length = 4095;
     size_t size = 0;
 
 //    std::cerr << "lz77 encode block" << std::endl;
-    while (lz77_encoded.size() <= max_size) {
+    while (true) {
 
       // get longest prefix
       auto [c, distance, length] = longest_prefix();
 
-      if (min_prefix_length <= length && length <= max_prefix_length) {
+      if (MinMatchLength <= length && length <= MaxMatchLength) {
         // discard length from input
         lz77_encoded.emplace_back(c, distance, length);
 //        std::cerr << "match(" << distance << "," << length << ")";
@@ -968,7 +989,7 @@ class Deflate {
         // discard length from input
         if (length > 0) {
           for (size_t i = 0; i < length; i++) {
-            auto ch = window_.at(window_.size() - length + i - 1);
+            auto ch = window_.at(window_.size()-1 - length + i);
             lz77_encoded.emplace_back(ch, 0, 0);
 //            std::cout << (char)ch;
           }
@@ -977,9 +998,14 @@ class Deflate {
         lz77_encoded.emplace_back(c, 0, 0);
       }
       size += length;
+//      std::cerr << "lz77 size " << size << std::endl;
       if (c != EOF) {
         size += 1;
       } else {
+        break;
+      }
+      if (lz77_encoded.size() >= max_size) {
+        lz77_encoded.emplace_back(EOF, 0, 0);
         break;
       }
     }
